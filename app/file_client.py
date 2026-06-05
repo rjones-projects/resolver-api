@@ -4,9 +4,6 @@ FileServiceClient
 Routes all GitHub file access through a configurable local service instead of
 calling GitHub directly. Configure the service URL via the FILE_SERVICE_URL
 environment variable (default: https://repo-api-479677124022.europe-west2.run.app).
-
-Authentication is sent as an "Authorization: Bearer <token>" header, with the
-token read from the GH_TOKEN environment variable.
 """
 
 from __future__ import annotations
@@ -18,15 +15,13 @@ import httpx
 import yaml
 
 FILE_SERVICE_URL: str = os.getenv("FILE_SERVICE_URL", "https://repo-api-479677124022.europe-west2.run.app")
-FILE_SERVICE_TOKEN: Optional[str] = os.getenv("GH_TOKEN")
 
 
 class FileServiceClient:
     """HTTP client that fetches files via the local GitHub file service."""
 
-    def __init__(self, base_url: Optional[str] = None, token: Optional[str] = None):
+    def __init__(self, base_url: Optional[str] = None):
         self.base_url = (base_url or FILE_SERVICE_URL).rstrip("/")
-        self.token = token or FILE_SERVICE_TOKEN
 
     # ------------------------------------------------------------------
     # Low-level request
@@ -35,10 +30,8 @@ class FileServiceClient:
     def _get(self, endpoint: str, **params: Any) -> httpx.Response:
         url = f"{self.base_url}{endpoint}"
         filtered = {k: v for k, v in params.items() if v is not None}
-        # Auth is sent as an Authorization: Bearer <token> header.
-        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
         with httpx.Client(timeout=15) as client:
-            resp = client.get(url, params=filtered, headers=headers)
+            resp = client.get(url, params=filtered)
         resp.raise_for_status()
         return resp
 
