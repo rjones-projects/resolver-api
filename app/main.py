@@ -75,7 +75,7 @@ class DeploymentResolveResponse(BaseModel):
 
 
 @app.post(
-    "/catalog/resolve",
+    "/resolve",
     response_model=DeploymentResolveResponse,
     summary="Resolve building blocks into Terraform files",
     responses={

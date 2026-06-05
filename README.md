@@ -40,7 +40,7 @@ uvicorn app.main:app --reload --port 8080
 ### `GET /health`
 Returns `{"status": "ok"}`.
 
-### `POST /catalog/resolve`
+### `POST /resolve`
 
 Accepts a deployment payload whose `building_blocks` map each building block name to a
 dict of variable overrides (use `{}` for no overrides). Resolves them to GCP Terraform
@@ -99,7 +99,7 @@ modules and returns ready-to-use `main.tf`, `variables.tf`, and `terraform.tfvar
 **Example curl**
 
 ```bash
-curl -s -X POST http://localhost:8080/catalog/resolve \
+curl -s -X POST http://localhost:8080/resolve \
   -H 'Content-Type: application/json' \
   -d '{
     "payload": {
@@ -175,5 +175,5 @@ CATALOG_MAPPING_FILE=gcp-mapping.yaml
 docker build -t resolver-api .
 #docker tag resolver-api europe-west2-docker.pkg.dev/idp-poc-495014/resolver-api/resolver-api:latest
 #docker push europe-west2-docker.pkg.dev/idp-poc-495014/resolver-api/resolver-api:latest
-#docker run -p 8080:8080 resolver-api
+#docker run -p 8081:8080 resolver-api
 ```
