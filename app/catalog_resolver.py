@@ -532,17 +532,23 @@ class CatalogResolver:
 
     def _find_config_var_for_key(self, key: str, mod: ResolvedModule) -> Optional[str]:
         """
-        Find the any-typed config variable whose _default object contains 'key'
-        as a direct child field.
-        e.g. key='machine_type', mod=gke_standard_cluster  →  'gke_standard_cluster'
+        Find the config variable that should carry 'key' and return its name.
+
+        Modules describe a block's schema with an object-typed `<name>_default`
+        variable. If 'key' is one of that object's direct fields, route it:
+          - to the sibling any-typed `<name>` override variable when one exists
+            (the module merges it over the defaults), otherwise
+          - into the `<name>_default` variable itself, so the value lands nested
+            inside the right structure (e.g. bucket_default = { ... }).
         """
         for var in mod.variables:
             if not (var.name.endswith("_default") and "object(" in var.type_hcl):
                 continue
             if key in self._extract_object_field_names(var.type_hcl):
-                config_var_name = var.name[: -len("_default")]
-                if any(v.name == config_var_name for v in mod.variables):
-                    return config_var_name
+                sibling = var.name[: -len("_default")]
+                if any(v.name == sibling for v in mod.variables):
+                    return sibling
+                return var.name
         return None
 
     @staticmethod
@@ -563,7 +569,16 @@ class CatalogResolver:
             if depth == 1:
                 chars.append(c)
             i += 1
-        return set(re.findall(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=", "".join(chars), re.MULTILINE))
+        # Only depth-1 characters are collected, so the fields are separated by
+        # commas and/or newlines (any commas inside nested type calls are at
+        # deeper depth and excluded). Split on both to catch single-line and
+        # multi-line object definitions alike.
+        names: set[str] = set()
+        for part in re.split(r"[,\n]", "".join(chars)):
+            fm = re.match(r"\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=", part)
+            if fm:
+                names.add(fm.group(1))
+        return names
 
     @staticmethod
     def _render_hcl_value(value: Any, indent: int = 0) -> str:
