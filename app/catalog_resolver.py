@@ -450,15 +450,19 @@ class CatalogResolver:
         Optional preamble dict is written first (e.g. project_id, region).
         """
         lines: list[str] = []
-        # Tracks top-level var names already written to avoid duplicates.
-        written_top_level: dict[str, Any] = {}
+        preamble_keys = set(preamble or {})
 
         # Write preamble vars (project_id, region, etc.) before block sections.
         if preamble:
-            for key, value in preamble.items():
-                lines.append(f"{key} = {self._render_hcl_value(value)}")
-                written_top_level[key] = value
+            preamble_pairs = [(key, self._render_hcl_value(value)) for key, value in preamble.items()]
+            lines.extend(self._align_assignments(preamble_pairs, ""))
             lines.append("")
+
+        # Top-level (unmatched) keys are deduplicated across all building blocks and
+        # emitted once, after the block sections, so an attribute is never redefined.
+        # Later value wins; a warning comment records each overridden value.
+        top_level: dict[str, Any] = {}
+        top_level_warnings: list[str] = []
 
         for block_name, overrides in overrides_map.items():
             if isinstance(overrides, list):
@@ -471,7 +475,6 @@ class CatalogResolver:
                 continue
 
             module_names = mapping[block_name]
-            lines.append(f"# {block_name} (modules: {', '.join(module_names) or 'none'})")
 
             # Route each key to the matching any-typed config variable across modules.
             var_assignments: dict[str, dict[str, Any]] = {}
@@ -490,30 +493,42 @@ class CatalogResolver:
                         still_unmatched[key] = value
                 unmatched = still_unmatched
 
-            for var_name, kv in var_assignments.items():
-                lines.append(f"{var_name} = {{")
-                for k, v in kv.items():
-                    lines.append(f"  {k} = {self._render_hcl_value(v, indent=1)}")
-                lines.append("}")
+            if var_assignments:
+                lines.append(f"# {block_name} (modules: {', '.join(module_names) or 'none'})")
+                for var_name, kv in var_assignments.items():
+                    lines.append(f"{var_name} = {{")
+                    pairs = [(k, self._render_hcl_value(v, indent=1)) for k, v in kv.items()]
+                    lines.extend(self._align_assignments(pairs, "  "))
+                    lines.append("}")
+                lines.append("")
 
+            # Accumulate top-level keys for the consolidated section below.
             for key, value in unmatched.items():
-                if key in written_top_level:
-                    if written_top_level[key] != value:
-                        lines.append(
-                            f"# WARNING: '{key}' conflict — "
-                            f"was {self._render_hcl_value(written_top_level[key])}, "
-                            f"now {self._render_hcl_value(value)}."
+                if key in preamble_keys:
+                    if preamble[key] != value:
+                        top_level_warnings.append(
+                            f"# WARNING: '{key}' from '{block_name}' "
+                            f"({self._render_hcl_value(value)}) ignored — set in preamble."
                         )
-                        lines.append(f"{key} = {self._render_hcl_value(value)}")
-                        written_top_level[key] = value
-                    # Same value already written — skip silently.
-                else:
-                    lines.append(f"{key} = {self._render_hcl_value(value)}")
-                    written_top_level[key] = value
+                    continue
+                if key in top_level and top_level[key] != value:
+                    top_level_warnings.append(
+                        f"# WARNING: '{key}' conflict — "
+                        f"was {self._render_hcl_value(top_level[key])}, "
+                        f"now {self._render_hcl_value(value)} (later value wins)."
+                    )
+                top_level[key] = value
 
+        # Emit the deduplicated top-level keys once, after all block sections.
+        if top_level or top_level_warnings:
+            lines.extend(top_level_warnings)
+            top_pairs = [(key, self._render_hcl_value(value)) for key, value in top_level.items()]
+            lines.extend(self._align_assignments(top_pairs, ""))
             lines.append("")
 
-        return "\n".join(lines)
+        while lines and lines[-1] == "":
+            lines.pop()
+        return ("\n".join(lines) + "\n") if lines else ""
 
     def _find_config_var_for_key(self, key: str, mod: ResolvedModule) -> Optional[str]:
         """
@@ -573,9 +588,35 @@ class CatalogResolver:
         if isinstance(value, dict):
             if not value:
                 return "{}"
-            body = "\n".join(
-                f"{inner}{k} = {CatalogResolver._render_hcl_value(v, indent + 1)}"
-                for k, v in value.items()
-            )
+            pairs = [(k, CatalogResolver._render_hcl_value(v, indent + 1)) for k, v in value.items()]
+            body = "\n".join(CatalogResolver._align_assignments(pairs, inner))
             return "{\n" + body + f"\n{pad}}}"
         return f'"{value}"'
+
+    @staticmethod
+    def _align_assignments(pairs: list[tuple[str, str]], prefix: str) -> list[str]:
+        """
+        Render `key = value` lines with the `=` aligned across each run of
+        consecutive single-line assignments, matching `terraform fmt`.
+
+        A value that spans multiple lines (a nested block) is not aligned and
+        breaks the surrounding run, so the next run starts fresh after it.
+        """
+        lines: list[str] = []
+        group: list[tuple[str, str]] = []
+
+        def flush() -> None:
+            if not group:
+                return
+            width = max(len(k) for k, _ in group)
+            lines.extend(f"{prefix}{k.ljust(width)} = {v}" for k, v in group)
+            group.clear()
+
+        for key, val in pairs:
+            if "\n" in val:
+                flush()
+                lines.append(f"{prefix}{key} = {val}")
+            else:
+                group.append((key, val))
+        flush()
+        return lines
