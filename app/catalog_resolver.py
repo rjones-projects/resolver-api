@@ -452,6 +452,12 @@ class CatalogResolver:
         lines: list[str] = []
         preamble_keys = set(preamble or {})
 
+        # Names of every variable declared across the resolved modules — i.e. the
+        # union written to variables.tf. A terraform.tfvars file may only assign
+        # declared variables, so any override key outside this set (and not routed
+        # into an object config var) cannot be emitted as a bare assignment.
+        known_var_names = {v.name for mod in modules_by_name.values() for v in mod.variables}
+
         # Write preamble vars (project_id, region, etc.) before block sections.
         if preamble:
             preamble_pairs = [(key, self._render_hcl_value(value)) for key, value in preamble.items()]
@@ -463,6 +469,9 @@ class CatalogResolver:
         # Later value wins; a warning comment records each overridden value.
         top_level: dict[str, Any] = {}
         top_level_warnings: list[str] = []
+        # Keys that match no declared variable at all — recorded as comments so the
+        # generated file stays valid (a bare assignment would fail terraform).
+        unmapped: dict[str, Any] = {}
 
         for block_name, overrides in overrides_map.items():
             if isinstance(overrides, list):
@@ -511,6 +520,10 @@ class CatalogResolver:
                             f"({self._render_hcl_value(value)}) ignored — set in preamble."
                         )
                     continue
+                if key not in known_var_names:
+                    # No declared variable — would break terraform if assigned.
+                    unmapped[key] = value
+                    continue
                 if key in top_level and top_level[key] != value:
                     top_level_warnings.append(
                         f"# WARNING: '{key}' conflict — "
@@ -526,6 +539,15 @@ class CatalogResolver:
             lines.extend(self._align_assignments(top_pairs, ""))
             lines.append("")
 
+        # Record override keys that matched no variable as comments — emitting them
+        # as assignments would make terraform fail with "Unexpected attribute".
+        if unmapped:
+            lines.append("# The following override keys matched no variable in the resolved")
+            lines.append("# modules and were skipped (set them inside the correct structure):")
+            for key, value in unmapped.items():
+                lines.append(f"#   {key} = {self._render_hcl_value(value)}")
+            lines.append("")
+
         while lines and lines[-1] == "":
             lines.pop()
         return ("\n".join(lines) + "\n") if lines else ""
@@ -535,20 +557,31 @@ class CatalogResolver:
         Find the config variable that should carry 'key' and return its name.
 
         Modules describe a block's schema with an object-typed `<name>_default`
-        variable. If 'key' is one of that object's direct fields, route it:
-          - to the sibling any-typed `<name>` override variable when one exists
-            (the module merges it over the defaults), otherwise
-          - into the `<name>_default` variable itself, so the value lands nested
-            inside the right structure (e.g. bucket_default = { ... }).
+        variable that holds a complete set of defaults, plus a loosely-typed
+        (`any`) entry variable the user actually populates; the module merges the
+        entry over the defaults. The entry variable is named either by stripping
+        the `_default` suffix (e.g. dns_default → dns) or after the module itself
+        (e.g. gcs owns bucket_default, iam_service_account owns
+        service_account_default).
+
+        If 'key' is a direct field of some `<name>_default` object, route it into
+        that merge entry variable. The strict `<name>_default` object is never a
+        valid target — object types require *every* attribute, so assigning a
+        partial value there fails. When no merge entry exists, return None so the
+        caller records the key as unmapped rather than emitting invalid HCL.
         """
+        by_name = {v.name: v for v in mod.variables}
         for var in mod.variables:
             if not (var.name.endswith("_default") and "object(" in var.type_hcl):
                 continue
-            if key in self._extract_object_field_names(var.type_hcl):
-                sibling = var.name[: -len("_default")]
-                if any(v.name == sibling for v in mod.variables):
-                    return sibling
-                return var.name
+            if key not in self._extract_object_field_names(var.type_hcl):
+                continue
+            # Prefer the `<name>` sibling, else the module's own entry variable.
+            for candidate in (var.name[: -len("_default")], mod.name):
+                entry = by_name.get(candidate)
+                if entry is not None and "object(" not in entry.type_hcl:
+                    return candidate
+            return None
         return None
 
     @staticmethod
