@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 REPO_OWNER = os.getenv("REPO_OWNER", "rjones-projects")
 # Auto-created Terraform repos are private by default; override with REPO_PRIVATE=false.
 # REPO_PRIVATE = os.getenv("REPO_PRIVATE", "true").lower() != "false"
-REPO_PRIVATE = "false"
+REPO_PRIVATE = 0
 
 def _generate_repo_name() -> str:
     """Build a new repo name: 'IDP-demo-' plus a random 3-letter suffix."""
