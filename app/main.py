@@ -3,6 +3,9 @@ Resolver API — resolves building blocks into Terraform files via the catalog m
 """
 
 import logging
+import os
+import random
+import string
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -12,9 +15,54 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from app.catalog_resolver import CatalogResolver
+from app.file_client import get_client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Owner/org under which generated Terraform repos are created.
+REPO_OWNER = os.getenv("REPO_OWNER", "rjones-projects")
+# Auto-created Terraform repos are private by default; override with REPO_PRIVATE=false.
+# REPO_PRIVATE = os.getenv("REPO_PRIVATE", "true").lower() != "false"
+REPO_PRIVATE = "false"
+
+def _generate_repo_name() -> str:
+    """Build a new repo name: 'IDP-demo-' plus a random 3-letter suffix."""
+    suffix = "".join(random.choices(string.ascii_lowercase, k=3))
+    return f"IDP-demo-{suffix}"
+
+
+def _push_terraform(result: dict, deployment_id: Optional[str]) -> dict:
+    """
+    Push the generated Terraform files to a new 'IDP-demo-<xyz>' repo via the
+    repo-api. Returns a status dict for the response. Failures are caught and
+    reported (status='error') so a push problem never discards the generated
+    Terraform the caller still wants.
+    """
+    files = {
+        name: result[key]
+        for name, key in (
+            ("main.tf", "main_tf"),
+            ("variables.tf", "variables_tf"),
+            ("terraform.tfvars", "terraform_tfvars"),
+        )
+        if result.get(key)
+    }
+    repo_name = _generate_repo_name()
+    message = f"Add generated Terraform for deployment {deployment_id or repo_name}"
+    try:
+        commit = get_client().commit_files(
+            owner=REPO_OWNER,
+            repo=repo_name,
+            files=files,
+            message=message,
+            private=REPO_PRIVATE,
+        )
+        logger.info("Pushed Terraform to %s/%s (%s)", REPO_OWNER, repo_name, commit.get("commit_sha"))
+        return {"status": "pushed", "owner": REPO_OWNER, **commit}
+    except Exception as exc:
+        logger.exception("Failed to push generated Terraform to %s/%s", REPO_OWNER, repo_name)
+        return {"status": "error", "owner": REPO_OWNER, "repo": repo_name, "error": str(exc)}
 
 # ── App setup ───────────────────────────────────────────────────────────────
 
@@ -72,6 +120,11 @@ class DeploymentResolveResponse(BaseModel):
     variables_tf: str
     terraform_tfvars: str
     summary: dict
+    repository: Optional[dict] = Field(
+        None,
+        description="Result of pushing the generated Terraform to a new repo "
+        "(repo name, branch, commit SHA, files), or an error if the push failed.",
+    )
 
 
 @app.post(
@@ -111,11 +164,14 @@ def resolve_catalog(request: DeploymentRequest):
         )
         result = resolver.resolve(overrides_map=overrides_map, tfvars_preamble=preamble or None)
 
+        repository = _push_terraform(result, request.deploymentId)
+
         return {
             "deploymentId": request.deploymentId,
             "status": "resolved",
             "projectId": p.projectId,
             "projectName": p.projectName,
+            "repository": repository,
             **result,
         }
     except RuntimeError as exc:

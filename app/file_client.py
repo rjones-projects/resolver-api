@@ -35,6 +35,13 @@ class FileServiceClient:
         resp.raise_for_status()
         return resp
 
+    def _post(self, endpoint: str, json_body: dict[str, Any]) -> httpx.Response:
+        url = f"{self.base_url}{endpoint}"
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(url, json=json_body)
+        resp.raise_for_status()
+        return resp
+
     # ------------------------------------------------------------------
     # File access helpers used by the resolver
     # ------------------------------------------------------------------
@@ -64,6 +71,28 @@ class FileServiceClient:
         data = yaml.safe_load(resp.text) or {}
         content = data.get("content", "")
         return content if isinstance(content, str) else yaml.dump(content, allow_unicode=True)
+
+    def commit_files(
+        self,
+        owner: str,
+        repo: str,
+        files: dict[str, str],
+        message: str,
+        branch: str = "main",
+        private: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Commit files to a GitHub repository via the repo-api. The repo (and the
+        target branch) are auto-created if they don't yet exist.
+
+        `files` maps each repo-relative path to its full text content. Returns the
+        parsed CommitResponse: {repo, branch, commit_sha, files_committed}.
+        """
+        resp = self._post(
+            f"/repos/{owner}/{repo}/commit",
+            {"message": message, "files": files, "branch": branch, "private": private},
+        )
+        return resp.json()
 
     def proxy_catalog_file(
         self,
