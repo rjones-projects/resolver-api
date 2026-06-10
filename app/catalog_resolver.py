@@ -469,9 +469,10 @@ class CatalogResolver:
         # Later value wins; a warning comment records each overridden value.
         top_level: dict[str, Any] = {}
         top_level_warnings: list[str] = []
-        # Keys that match no declared variable at all — recorded as comments so the
-        # generated file stays valid (a bare assignment would fail terraform).
-        unmapped: dict[str, Any] = {}
+        # Overrides that match no variable in their block's modules. Recorded as
+        # error comments (never assignments) so the file stays valid while making
+        # the misconfiguration visible. Each entry: (block, modules, key, value).
+        unmapped: list[tuple[str, list[str], str, Any]] = []
 
         for block_name, overrides in overrides_map.items():
             if isinstance(overrides, list):
@@ -522,7 +523,7 @@ class CatalogResolver:
                     continue
                 if key not in known_var_names:
                     # No declared variable — would break terraform if assigned.
-                    unmapped[key] = value
+                    unmapped.append((block_name, module_names, key, value))
                     continue
                 if key in top_level and top_level[key] != value:
                     top_level_warnings.append(
@@ -539,13 +540,18 @@ class CatalogResolver:
             lines.extend(self._align_assignments(top_pairs, ""))
             lines.append("")
 
-        # Record override keys that matched no variable as comments — emitting them
-        # as assignments would make terraform fail with "Unexpected attribute".
+        # Log override keys that matched no variable as errors — emitting them as
+        # assignments would make terraform fail with "Unexpected attribute".
         if unmapped:
-            lines.append("# The following override keys matched no variable in the resolved")
-            lines.append("# modules and were skipped (set them inside the correct structure):")
-            for key, value in unmapped.items():
-                lines.append(f"#   {key} = {self._render_hcl_value(value)}")
+            lines.append("# ERRORS: the following overrides have no corresponding variable")
+            lines.append("# in their building block's modules and were skipped:")
+            for block_name, module_names, key, value in unmapped:
+                mods = ", ".join(module_names) or "none"
+                lines.append(
+                    f"# ERROR: override '{key} = {self._render_hcl_value(value)}' "
+                    f"for building block '{block_name}' (modules: {mods}) "
+                    f"has no corresponding variable."
+                )
             lines.append("")
 
         while lines and lines[-1] == "":
