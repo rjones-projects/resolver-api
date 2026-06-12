@@ -22,9 +22,8 @@ logger = logging.getLogger(__name__)
 
 # Owner/org under which generated Terraform repos are created.
 REPO_OWNER = os.getenv("REPO_OWNER", "rjones-projects")
-# Auto-created Terraform repos are private by default; override with REPO_PRIVATE=false.
-# REPO_PRIVATE = os.getenv("REPO_PRIVATE", "true").lower() != "false"
-REPO_PRIVATE = 0
+# Subfolder within the new repo that the generated Terraform is written to.
+REPO_DESTINATION = os.getenv("REPO_DESTINATION", "infra")
 
 def _generate_repo_name() -> str:
     """Build a new repo name: 'IDP-demo-' plus a random 3-letter suffix."""
@@ -56,7 +55,7 @@ def _push_terraform(result: dict, deployment_id: Optional[str]) -> dict:
             repo=repo_name,
             files=files,
             message=message,
-            private=REPO_PRIVATE,
+            destination=REPO_DESTINATION,
         )
         logger.info("Pushed Terraform to %s/%s (%s)", REPO_OWNER, repo_name, commit.get("commit_sha"))
         return {"status": "pushed", "owner": REPO_OWNER, **commit}

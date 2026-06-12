@@ -78,20 +78,21 @@ class FileServiceClient:
         repo: str,
         files: dict[str, str],
         message: str,
-        branch: str = "main",
-        private: bool = False,
+        destination: str = "infra",
     ) -> dict[str, Any]:
         """
-        Commit files to a GitHub repository via the repo-api. The repo (and the
-        target branch) are auto-created if they don't yet exist.
+        Commit files to a GitHub repository via the repo-api. The repo is
+        auto-created if it doesn't exist; the repo-api writes the files under
+        `destination/`, commits them on a new branch, and opens a pull request.
 
-        `files` maps each repo-relative path to its full text content. Returns the
-        parsed CommitResponse: {repo, branch, commit_sha, files_committed}.
+        `files` maps each path (relative to `destination/`) to its full text
+        content. Returns the parsed CommitResponse: {repo, branch, commit_sha,
+        files_committed, created_repo, pull_request_url, workflow_path}.
         """
-        resp = self._post(
-            f"/repos/{owner}/{repo}/commit",
-            {"message": message, "files": files, "branch": branch, "private": private},
-        )
+        body: dict[str, Any] = {"message": message, "files": files}
+        if destination:
+            body["destination"] = destination
+        resp = self._post(f"/repos/{owner}/{repo}/commit", body)
         return resp.json()
 
     def proxy_catalog_file(
