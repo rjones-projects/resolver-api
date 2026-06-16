@@ -361,6 +361,7 @@ class CatalogResolver:
                 "",
                 f'  backend "{self.backend}" {{',
                 "    # TODO: configure backend settings",
+                '     path = "./terraform.tfstate"',
                 "  }",
             ]
 
