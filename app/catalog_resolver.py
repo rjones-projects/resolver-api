@@ -356,24 +356,26 @@ class CatalogResolver:
             "  }",
         ]
 
-        if self.backend:
+        if self.backend == "local":
+            lines += [
+                "",
+                '  backend "local" {',
+                '    path = "./terraform.tfstate"',
+                "  }",
+            ]
+        elif self.backend:
             lines += [
                 "",
                 f'  backend "{self.backend}" {{',
                 "    # TODO: configure backend settings",
-                '     path = "./terraform.tfstate"',
                 "  }",
             ]
 
         lines += ["}", ""]
 
-        lines += [
-            'provider "google" {',
-            "  project = var.project_id",
-            "  region  = var.region",
-            "}",
-            "",
-        ]
+        # NOTE: the `provider "google"` configuration lives in providers.tf
+        # (supplied by the repo-api for CI auth); declaring it here too would be a
+        # duplicate provider configuration.
 
         for mod in modules:
             lines.append(f'module "{mod.name}" {{')

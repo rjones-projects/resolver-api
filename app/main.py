@@ -158,7 +158,7 @@ def resolve_catalog(request: DeploymentRequest):
         resolver = CatalogResolver(
             building_blocks=block_names,
             terraform_version=p.terraform_version or "~> 1.9",
-            backend=p.backend,
+            backend=p.backend or "local",
             modules_ref=p.modules_ref or "main",
         )
         result = resolver.resolve(overrides_map=overrides_map, tfvars_preamble=preamble or None)
