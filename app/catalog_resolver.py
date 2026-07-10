@@ -530,7 +530,11 @@ class CatalogResolver:
             lines.append(f'module "{mod.name}" {{')
             lines.append(f'  source = "{mod.source}"')
             if mod.fetch_error:
-                lines.append(f"  # WARNING: {mod.fetch_error}")
+                # fetch_error may come from a raw exception (e.g. httpx's multi-line
+                # "Server error ...\nFor more information check: ..."); comment out
+                # every line so it can't be parsed as HCL.
+                for error_line in str(mod.fetch_error).splitlines() or [""]:
+                    lines.append(f"  # WARNING: {error_line}")
                 lines.append("  # Add module inputs manually.")
             elif mod.variables:
                 lines.append("")
