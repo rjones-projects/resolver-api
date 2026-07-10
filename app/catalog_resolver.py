@@ -4,11 +4,15 @@ CatalogResolver
 Fetches the building-block → module mapping from the catalog YAML at:
   https://raw.githubusercontent.com/rjones-projects/catalog/main/gcp-mapping.yaml
 
-For each resolved module, pulls variables.tf from:
+For each resolved module, pulls variables.tf (and outputs.tf, to wire module-to-module
+dependencies) from:
   https://raw.githubusercontent.com/rjones-projects/gcp_terraform-modules/main/<module>/variables.tf
+  https://raw.githubusercontent.com/rjones-projects/gcp_terraform-modules/main/<module>/outputs.tf
 
 Produces:
-  - main.tf      : terraform{} block, google provider stub, module blocks
+  - main.tf      : terraform{} block, google provider stub, module blocks. A module
+                    input that matches an output of one of its catalog dependencies is
+                    wired to `module.<dependency>.<output>` instead of `var.<input>`.
   - variables.tf : merged variables with defaults / required-variable placeholders
 """
 
@@ -73,6 +77,8 @@ class ResolvedModule:
     name: str
     source: str
     variables: list[CatalogVariable] = field(default_factory=list)
+    outputs: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
     fetch_error: Optional[str] = None
 
 
@@ -105,7 +111,7 @@ class CatalogResolver:
         modules_by_name = {m.name: m for m in modules}
 
         all_vars = self._collect_variables(modules)
-        main_tf = self._render_main(modules)
+        main_tf = self._render_main(modules, modules_by_name)
         variables_tf = self._render_variables(all_vars)
         terraform_tfvars = (
             self._render_tfvars(overrides_map, mapping, modules_by_name, preamble=tfvars_preamble)
@@ -148,15 +154,15 @@ class CatalogResolver:
             name = (doc.get("metadata") or {}).get("name", "")
             if not name:
                 continue
-            depends_on = (doc.get("spec") or {}).get("dependsOn") or []
-            mapping[name] = self._parse_depends_on(depends_on)
+            dependencies = (doc.get("spec") or {}).get("dependencies") or []
+            mapping[name] = self._parse_dependencies(dependencies)
 
         return mapping
 
     @staticmethod
-    def _parse_depends_on(depends_on: list) -> list[str]:
+    def _parse_dependencies(dependencies: list) -> list[str]:
         modules = []
-        for dep in depends_on:
+        for dep in dependencies:
             if isinstance(dep, dict):
                 # "Component: module_name" (space after colon) is parsed by YAML
                 # as {"Component": "module_name"} — extract the value directly.
@@ -177,19 +183,34 @@ class CatalogResolver:
         mapping: dict[str, list[str]],
         block_names: Optional[list[str]] = None,
     ) -> list[ResolvedModule]:
+        """
+        Resolve each requested building block to its catalog modules, then follow each
+        module's own catalog entry (if any) transitively so that modules it depends on
+        for output wiring — even when not a direct building-block dependency — are
+        also resolved and rendered in main.tf.
+        """
         seen: dict[str, ResolvedModule] = {}
+        queue: list[str] = []
         for block in (block_names if block_names is not None else self.building_blocks):
-            for module_name in mapping.get(block, []):
-                if module_name in seen:
-                    continue
-                source = f"{GCP_MODULES_SOURCE}//{MODULES_SUBDIR}/{module_name}?ref={self.modules_ref}"
-                variables, error = self._fetch_module_variables(module_name)
-                seen[module_name] = ResolvedModule(
-                    name=module_name,
-                    source=source,
-                    variables=variables,
-                    fetch_error=error,
-                )
+            queue.extend(mapping.get(block, []))
+
+        while queue:
+            module_name = queue.pop(0)
+            if module_name in seen:
+                continue
+            source = f"{GCP_MODULES_SOURCE}//{MODULES_SUBDIR}/{module_name}?ref={self.modules_ref}"
+            variables, error = self._fetch_module_variables(module_name)
+            outputs = self._fetch_module_outputs(module_name)
+            dependencies = mapping.get(module_name, [])
+            seen[module_name] = ResolvedModule(
+                name=module_name,
+                source=source,
+                variables=variables,
+                outputs=outputs,
+                dependencies=dependencies,
+                fetch_error=error,
+            )
+            queue.extend(d for d in dependencies if d not in seen)
         return list(seen.values())
 
     # ------------------------------------------------------------------
@@ -221,19 +242,40 @@ class CatalogResolver:
             )
             for name, fields in (
                 (name, self._parse_variable_body(body))
-                for name, body in self._extract_variable_blocks(content)
+                for name, body in self._extract_named_blocks(content, "variable")
             )
         ]
 
+    # ------------------------------------------------------------------
+    # outputs.tf fetch & parse (for module-to-module dependency wiring)
+    # ------------------------------------------------------------------
+
+    def _fetch_module_outputs(self, module_name: str) -> list[str]:
+        path = f"{MODULES_SUBDIR}/{module_name}/outputs.tf"
+        try:
+            content = get_client().get_text_file(MODULES_OWNER, MODULES_REPO, path, ref=self.modules_ref)
+            return self._parse_outputs_tf(content)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                logger.warning("Failed to fetch outputs.tf for %s: %s", module_name, exc)
+            return []
+        except Exception as exc:
+            logger.warning("Failed to fetch outputs.tf for %s: %s", module_name, exc)
+            return []
+
+    def _parse_outputs_tf(self, content: str) -> list[str]:
+        return [name for name, _ in self._extract_named_blocks(content, "output")]
+
     @staticmethod
-    def _extract_variable_blocks(content: str) -> list[tuple[str, str]]:
+    def _extract_named_blocks(content: str, keyword: str) -> list[tuple[str, str]]:
+        """Extract `keyword "name" { ... }` blocks (e.g. `variable`/`output`), depth-tracking braces."""
         results = []
         i = 0
         while i < len(content):
-            m = re.search(r'variable\s+"([^"]+)"\s*\{', content[i:])
+            m = re.search(rf'{keyword}\s+"([^"]+)"\s*\{{', content[i:])
             if not m:
                 break
-            var_name = m.group(1)
+            block_name = m.group(1)
             start = i + m.end()
             depth, j = 1, start
             while j < len(content) and depth > 0:
@@ -242,7 +284,7 @@ class CatalogResolver:
                 elif content[j] == "}":
                     depth -= 1
                 j += 1
-            results.append((var_name, content[start : j - 1]))
+            results.append((block_name, content[start : j - 1]))
             i = j
         return results
 
@@ -343,7 +385,7 @@ class CatalogResolver:
     # HCL rendering
     # ------------------------------------------------------------------
 
-    def _render_main(self, modules: list[ResolvedModule]) -> str:
+    def _render_main(self, modules: list[ResolvedModule], modules_by_name: dict[str, ResolvedModule]) -> str:
         lines: list[str] = [
             "terraform {",
             f'  required_version = "{self.terraform_version}"',
@@ -385,11 +427,31 @@ class CatalogResolver:
                 lines.append("  # Add module inputs manually.")
             elif mod.variables:
                 lines.append("")
+                dep_outputs = self._dependency_outputs(mod, modules_by_name)
                 for var in mod.variables:
-                    lines.append(f"  {var.name:<30} = var.{var.name}")
+                    value = dep_outputs.get(var.name, f"var.{var.name}")
+                    lines.append(f"  {var.name:<30} = {value}")
             lines += ["}", ""]
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _dependency_outputs(
+        mod: ResolvedModule, modules_by_name: dict[str, ResolvedModule]
+    ) -> dict[str, str]:
+        """
+        Map each output name exposed by mod's resolved catalog dependencies to a
+        `module.<dependency>.<output>` reference, so an input variable with a matching
+        name is wired to the dependency's output instead of `var.<input>`.
+        """
+        outputs: dict[str, str] = {}
+        for dep_name in mod.dependencies:
+            dep = modules_by_name.get(dep_name)
+            if not dep:
+                continue
+            for output_name in dep.outputs:
+                outputs.setdefault(output_name, f"module.{dep_name}.{output_name}")
+        return outputs
 
     def _render_variables(self, variables: list[CatalogVariable]) -> str:
         # Always include project_id and region; skip any module-defined duplicates of these
