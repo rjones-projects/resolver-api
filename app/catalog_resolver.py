@@ -291,10 +291,16 @@ class CatalogResolver:
         block_names: Optional[list[str]] = None,
     ) -> list[ResolvedModule]:
         """
-        Resolve each requested building block to its primary catalog modules, then
-        follow each module's own dependency list (module_deps) transitively so that
-        modules it needs for output wiring — even when not a direct building-block
-        dependency — are also resolved and rendered in main.tf.
+        Resolve only the primary modules of each explicitly-requested building block.
+
+        module_deps is used for output wiring only (see _dependency_outputs) and is
+        NOT used to pull in extra modules here — a module's dependency is only wired
+        to a `module.<dep>.<output>` reference when that dependency module is already
+        being resolved because its own building block was requested. Auto-including a
+        dependency's modules just to satisfy wiring would create real, resource-backed
+        module blocks for building blocks the caller never asked for and never
+        configured, leaving their "spec" inputs at their null default — which breaks
+        `terraform plan` (e.g. a `for_each`/`count` over a null config).
         """
         seen: dict[str, ResolvedModule] = {}
         queue: list[str] = []
@@ -317,7 +323,6 @@ class CatalogResolver:
                 dependencies=dependencies,
                 fetch_error=error,
             )
-            queue.extend(d for d in dependencies if d not in seen)
         return list(seen.values())
 
     # ------------------------------------------------------------------
