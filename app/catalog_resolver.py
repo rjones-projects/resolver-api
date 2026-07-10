@@ -104,29 +104,29 @@ class CatalogResolver:
         Resolve building blocks into main.tf + variables.tf.
         If overrides_map is provided (block → override dict or []), also produces terraform.tfvars.
         """
-        mapping = self._fetch_mapping()
+        block_modules, module_deps = self._fetch_mapping()
 
         block_names = list(overrides_map.keys()) if overrides_map is not None else self.building_blocks
-        modules = self._resolve_modules(mapping, block_names)
+        modules = self._resolve_modules(block_modules, module_deps, block_names)
         modules_by_name = {m.name: m for m in modules}
 
         all_vars = self._collect_variables(modules)
         main_tf = self._render_main(modules, modules_by_name)
         variables_tf = self._render_variables(all_vars)
         terraform_tfvars = (
-            self._render_tfvars(overrides_map, mapping, modules_by_name, preamble=tfvars_preamble)
+            self._render_tfvars(overrides_map, block_modules, modules_by_name, preamble=tfvars_preamble)
             if overrides_map
             else ""
         )
 
-        unresolved = [b for b in block_names if b not in mapping]
+        unresolved = [b for b in block_names if b not in block_modules]
         return {
             "main_tf": main_tf,
             "variables_tf": variables_tf,
             "terraform_tfvars": terraform_tfvars,
             "summary": {
                 "building_blocks_requested": block_names,
-                "building_blocks_resolved": [b for b in block_names if b in mapping],
+                "building_blocks_resolved": [b for b in block_names if b in block_modules],
                 "building_blocks_unresolved": unresolved,
                 "modules_resolved": [m.name for m in modules],
                 "variables_extracted": len(all_vars),
@@ -138,8 +138,21 @@ class CatalogResolver:
     # Catalog mapping fetch
     # ------------------------------------------------------------------
 
-    def _fetch_mapping(self) -> dict[str, list[str]]:
-        """Fetch the Backstage catalog YAML via the file service and return building_block -> [module_names]."""
+    def _fetch_mapping(self) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+        """
+        Fetch the Backstage catalog YAML via the file service and return:
+          - block_modules: building_block name -> [primary module names realizing it]
+          - module_deps:    module name -> [names of other modules whose outputs it
+                             needs wired into its inputs]
+
+        Each Component's `metadata.dependencies` is a dict of
+        `{primary_module: [dependency_module, ...]}`. A building block may realize to
+        several primary modules at once (e.g. "network" -> network/firewall/dns/...),
+        and `module_deps` is the union of every dict's entries across the whole
+        catalog, since a module's own dependency list is recorded wherever that
+        module first appears as a key — not necessarily under the block being
+        resolved right now.
+        """
         try:
             docs = get_client().proxy_catalog_file(
                 CATALOG_OWNER, CATALOG_REPO, CATALOG_MAPPING_FILE
@@ -147,32 +160,32 @@ class CatalogResolver:
         except Exception as exc:
             raise RuntimeError(f"Failed to fetch catalog mapping: {exc}") from exc
 
-        mapping: dict[str, list[str]] = {}
+        block_modules: dict[str, list[str]] = {}
+        module_deps: dict[str, list[str]] = {}
         for doc in docs:
             if not isinstance(doc, dict) or doc.get("kind") != "Component":
                 continue
-            name = (doc.get("metadata") or {}).get("name", "")
+            metadata = doc.get("metadata") or {}
+            name = metadata.get("name", "")
             if not name:
                 continue
-            dependencies = (doc.get("spec") or {}).get("dependencies") or []
-            mapping[name] = self._parse_dependencies(dependencies)
+            dependencies = metadata.get("dependencies")
+            if not isinstance(dependencies, dict):
+                dependencies = {}
+            block_modules[name] = self._valid_module_names(dependencies.keys())
+            for module_name, deps in dependencies.items():
+                module_deps[str(module_name).strip()] = self._valid_module_names(deps)
 
-        return mapping
+        return block_modules, module_deps
 
     @staticmethod
-    def _parse_dependencies(dependencies: list) -> list[str]:
-        modules = []
-        for dep in dependencies:
-            if isinstance(dep, dict):
-                # "Component: module_name" (space after colon) is parsed by YAML
-                # as {"Component": "module_name"} — extract the value directly.
-                name = str(next(iter(dep.values()), "")).strip()
-            else:
-                # "Component:module_name" (no space) stays as a plain string.
-                name = re.sub(r"^Component:\s*", "", str(dep)).strip()
-            if name and re.match(r"^[a-zA-Z][a-zA-Z0-9_]*$", name):
-                modules.append(name)
-        return modules
+    def _valid_module_names(names) -> list[str]:
+        result = []
+        for n in names or []:
+            n = str(n).strip()
+            if n and re.match(r"^[a-zA-Z][a-zA-Z0-9_]*$", n):
+                result.append(n)
+        return result
 
     # ------------------------------------------------------------------
     # Module resolution
@@ -180,19 +193,20 @@ class CatalogResolver:
 
     def _resolve_modules(
         self,
-        mapping: dict[str, list[str]],
+        block_modules: dict[str, list[str]],
+        module_deps: dict[str, list[str]],
         block_names: Optional[list[str]] = None,
     ) -> list[ResolvedModule]:
         """
-        Resolve each requested building block to its catalog modules, then follow each
-        module's own catalog entry (if any) transitively so that modules it depends on
-        for output wiring — even when not a direct building-block dependency — are
-        also resolved and rendered in main.tf.
+        Resolve each requested building block to its primary catalog modules, then
+        follow each module's own dependency list (module_deps) transitively so that
+        modules it needs for output wiring — even when not a direct building-block
+        dependency — are also resolved and rendered in main.tf.
         """
         seen: dict[str, ResolvedModule] = {}
         queue: list[str] = []
         for block in (block_names if block_names is not None else self.building_blocks):
-            queue.extend(mapping.get(block, []))
+            queue.extend(block_modules.get(block, []))
 
         while queue:
             module_name = queue.pop(0)
@@ -201,7 +215,7 @@ class CatalogResolver:
             source = f"{GCP_MODULES_SOURCE}//{MODULES_SUBDIR}/{module_name}?ref={self.modules_ref}"
             variables, error = self._fetch_module_variables(module_name)
             outputs = self._fetch_module_outputs(module_name)
-            dependencies = mapping.get(module_name, [])
+            dependencies = module_deps.get(module_name, [])
             seen[module_name] = ResolvedModule(
                 name=module_name,
                 source=source,
@@ -435,14 +449,21 @@ class CatalogResolver:
 
         return "\n".join(lines)
 
-    @staticmethod
+    # Output/variable names too generic to trust as an intentional wiring match —
+    # virtually every module has its own unrelated "name"/"id"/etc., so matching on
+    # these alone is far more likely to be a same-name coincidence (e.g. a "kms"
+    # dependency's key `name` output colliding with an unrelated `name` input on the
+    # dependent module) than a real wiring intent.
+    _GENERIC_OUTPUT_NAMES = {"id", "name", "project_id", "region", "location", "description", "labels"}
+
+    @classmethod
     def _dependency_outputs(
-        mod: ResolvedModule, modules_by_name: dict[str, ResolvedModule]
+        cls, mod: ResolvedModule, modules_by_name: dict[str, ResolvedModule]
     ) -> dict[str, str]:
         """
         Map each output name exposed by mod's resolved catalog dependencies to a
         `module.<dependency>.<output>` reference, so an input variable with a matching
-        name is wired to the dependency's output instead of `var.<input>`.
+        (non-generic) name is wired to the dependency's output instead of `var.<input>`.
         """
         outputs: dict[str, str] = {}
         for dep_name in mod.dependencies:
@@ -450,6 +471,8 @@ class CatalogResolver:
             if not dep:
                 continue
             for output_name in dep.outputs:
+                if output_name in cls._GENERIC_OUTPUT_NAMES:
+                    continue
                 outputs.setdefault(output_name, f"module.{dep_name}.{output_name}")
         return outputs
 
@@ -499,7 +522,7 @@ class CatalogResolver:
     def _render_tfvars(
         self,
         overrides_map: dict[str, Any],
-        mapping: dict[str, list[str]],
+        block_modules: dict[str, list[str]],
         modules_by_name: dict[str, ResolvedModule],
         preamble: Optional[dict[str, Any]] = None,
     ) -> str:
@@ -544,12 +567,12 @@ class CatalogResolver:
                 overrides = {}
             if not overrides:
                 continue
-            if block_name not in mapping:
+            if block_name not in block_modules:
                 lines.append(f"# WARNING: building block '{block_name}' not found in catalog — skipped.")
                 lines.append("")
                 continue
 
-            module_names = mapping[block_name]
+            module_names = block_modules[block_name]
 
             # Route each key to the matching any-typed config variable across modules.
             var_assignments: dict[str, dict[str, Any]] = {}
