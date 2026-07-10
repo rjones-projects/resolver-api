@@ -83,6 +83,11 @@ class ResolvedModule:
     variables: list[CatalogVariable] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
+    # input variable name -> "<dep_module>.<output>[.<attribute>...]", from an
+    # explicit `wire` map on the terraformModules entry. Takes precedence over the
+    # exact output-name match in _dependency_outputs, for cases where the output is
+    # a whole resource object and a specific attribute (e.g. `.name`) is needed.
+    wiring: dict[str, str] = field(default_factory=dict)
     fetch_error: Optional[str] = None
 
 
@@ -108,10 +113,10 @@ class CatalogResolver:
         Resolve building blocks into main.tf + variables.tf.
         If overrides_map is provided (block → override dict or []), also produces terraform.tfvars.
         """
-        block_modules, module_deps = self._fetch_mapping()
+        block_modules, module_deps, module_wiring = self._fetch_mapping()
 
         block_names = list(overrides_map.keys()) if overrides_map is not None else self.building_blocks
-        modules = self._resolve_modules(block_modules, module_deps, block_names)
+        modules = self._resolve_modules(block_modules, module_deps, module_wiring, block_names)
         modules_by_name = {m.name: m for m in modules}
 
         all_vars = self._collect_variables(modules)
@@ -142,12 +147,14 @@ class CatalogResolver:
     # Catalog mapping fetch
     # ------------------------------------------------------------------
 
-    def _fetch_mapping(self) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    def _fetch_mapping(self) -> tuple[dict[str, list[str]], dict[str, list[str]], dict[str, dict[str, str]]]:
         """
         Fetch both catalog sources and return:
           - block_modules: building_block name -> [primary module names realizing it]
           - module_deps:    module name -> [names of other modules whose outputs it
                              may need wired into its inputs]
+          - module_wiring:  module name -> {input_var: "<dep_module>.<output>[.<attr>...]"},
+                             explicit wiring for cases exact-name matching can't infer
 
         module_deps is merged from two sources:
           1. Fine-grained, module-specific wiring declared directly on a
@@ -161,8 +168,13 @@ class CatalogResolver:
              `{building_block: [building_block, ...]}`. Expanded to each dependency
              block's primary modules, so every primary module of a block inherits a
              dependency on every primary module of the blocks it depends on.
+
+        module_wiring comes only from an explicit `wire` map alongside `dependsOn` —
+        needed when the dependency's output is a whole resource object (e.g. a
+        `google_compute_network`) and a specific attribute (e.g. `.name`) must be
+        referenced, which name-matching alone can't determine.
         """
-        block_modules, intra_module_deps = self._fetch_block_modules()
+        block_modules, intra_module_deps, module_wiring = self._fetch_block_modules()
         block_deps = self._fetch_block_dependencies()
 
         module_deps: dict[str, list[str]] = {}
@@ -190,15 +202,17 @@ class CatalogResolver:
             for module_name in modules:
                 add_deps(module_name, candidate_deps)
 
-        return block_modules, module_deps
+        return block_modules, module_deps, module_wiring
 
     @staticmethod
-    def _fetch_block_modules() -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    def _fetch_block_modules() -> tuple[dict[str, list[str]], dict[str, list[str]], dict[str, dict[str, str]]]:
         """
         Fetch gcp-mapping.yaml and return:
           - block_modules: building_block name -> [primary module names]
           - intra_module_deps: module name -> [other module names it explicitly
             depends on], from an optional `dependsOn` key on its terraformModules entry
+          - intra_module_wiring: module name -> {input_var: dotted dependency path},
+            from an optional `wire` key on its terraformModules entry
         """
         try:
             docs = get_client().proxy_catalog_file(
@@ -209,6 +223,7 @@ class CatalogResolver:
 
         block_modules: dict[str, list[str]] = {}
         intra_module_deps: dict[str, list[str]] = {}
+        intra_module_wiring: dict[str, dict[str, str]] = {}
         for doc in docs:
             if not isinstance(doc, dict) or doc.get("kind") != "Component":
                 continue
@@ -216,11 +231,13 @@ class CatalogResolver:
             if not name:
                 continue
             refs = (doc.get("spec") or {}).get("terraformModules") or []
-            modules, deps = CatalogResolver._parse_terraform_modules(refs)
+            modules, deps, wiring = CatalogResolver._parse_terraform_modules(refs)
             block_modules[name] = modules
             for module_name, module_deps_list in deps.items():
                 intra_module_deps.setdefault(module_name, []).extend(module_deps_list)
-        return block_modules, intra_module_deps
+            for module_name, wire_map in wiring.items():
+                intra_module_wiring.setdefault(module_name, {}).update(wire_map)
+        return block_modules, intra_module_deps, intra_module_wiring
 
     @staticmethod
     def _fetch_block_dependencies() -> dict[str, list[str]]:
@@ -244,32 +261,44 @@ class CatalogResolver:
         return block_deps
 
     @staticmethod
-    def _parse_terraform_modules(refs: list) -> tuple[list[str], dict[str, list[str]]]:
+    def _parse_terraform_modules(refs: list) -> tuple[list[str], dict[str, list[str]], dict[str, dict[str, str]]]:
         """
         Parse a `terraformModules` list where each entry is one of:
           - "Component:module_name"
           - {"Component": "module_name"}
           - {"Component": "module_name", "dependsOn": ["other_module", ...]}
-        Returns (module_names, {module_name: [dependsOn names]}).
+          - {"Component": "module_name", "dependsOn": [...], "wire": {"input_var": "dep_module.output[.attr...]"}}
+        Returns (module_names, {module_name: [dependsOn names]}, {module_name: {input_var: dotted_path}}).
         """
         modules: list[str] = []
         deps: dict[str, list[str]] = {}
+        wiring: dict[str, dict[str, str]] = {}
         for ref in refs:
             if isinstance(ref, dict):
                 # "Component: module_name" (space after colon) is parsed by YAML
                 # as {"Component": "module_name", ...} — extract the value directly.
                 name = str(ref.get("Component", "")).strip()
                 depends_on = ref.get("dependsOn")
+                wire = ref.get("wire")
             else:
                 # "Component:module_name" (no space) stays as a plain string.
                 name = re.sub(r"^Component:\s*", "", str(ref)).strip()
                 depends_on = None
+                wire = None
             if not (name and re.match(r"^[a-zA-Z][a-zA-Z0-9_]*$", name)):
                 continue
             modules.append(name)
             if depends_on:
                 deps[name] = CatalogResolver._valid_module_names(depends_on)
-        return modules, deps
+            if isinstance(wire, dict):
+                wire_map = {
+                    str(k).strip(): str(v).strip()
+                    for k, v in wire.items()
+                    if str(k).strip() and str(v).strip()
+                }
+                if wire_map:
+                    wiring[name] = wire_map
+        return modules, deps, wiring
 
     @staticmethod
     def _valid_module_names(names) -> list[str]:
@@ -288,6 +317,7 @@ class CatalogResolver:
         self,
         block_modules: dict[str, list[str]],
         module_deps: dict[str, list[str]],
+        module_wiring: dict[str, dict[str, str]],
         block_names: Optional[list[str]] = None,
     ) -> list[ResolvedModule]:
         """
@@ -321,6 +351,7 @@ class CatalogResolver:
                 variables=variables,
                 outputs=outputs,
                 dependencies=dependencies,
+                wiring=module_wiring.get(module_name, {}),
                 fetch_error=error,
             )
         return list(seen.values())
@@ -545,7 +576,14 @@ class CatalogResolver:
                 lines.append("")
                 dep_outputs = self._dependency_outputs(mod, modules_by_name)
                 for var in mod.variables:
-                    value = dep_outputs.get(var.name, f"var.{var.name}")
+                    explicit = mod.wiring.get(var.name)
+                    # Only honor explicit wiring if its dependency module is actually
+                    # being resolved — otherwise `module.<dep>...` would reference a
+                    # block that doesn't exist in this main.tf.
+                    if explicit and explicit.split(".", 1)[0] in modules_by_name:
+                        value = f"module.{explicit}"
+                    else:
+                        value = dep_outputs.get(var.name, f"var.{var.name}")
                     lines.append(f"  {var.name:<30} = {value}")
             lines += ["}", ""]
 
