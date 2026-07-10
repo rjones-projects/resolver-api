@@ -3,6 +3,9 @@ CatalogResolver
 
 Fetches the building-block → module mapping from the catalog YAML at:
   https://raw.githubusercontent.com/rjones-projects/catalog/main/gcp-mapping.yaml
+and the building-block → building-block dependency graph, recorded per architecture
+pattern, from:
+  https://raw.githubusercontent.com/rjones-projects/catalog/main/catalog.yaml
 
 For each resolved module, pulls variables.tf (and outputs.tf, to wire module-to-module
 dependencies) from:
@@ -31,12 +34,13 @@ from app.file_client import get_client
 logger = logging.getLogger(__name__)
 
 # Repository coordinates — all configurable via environment variables.
-CATALOG_OWNER        = os.getenv("CATALOG_OWNER",        "rjones-projects")
-CATALOG_REPO         = os.getenv("CATALOG_REPO",         "catalog")
-CATALOG_MAPPING_FILE = os.getenv("CATALOG_MAPPING_FILE", "gcp-mapping.yaml")
-MODULES_OWNER        = os.getenv("MODULES_OWNER",        "rjones-projects")
-MODULES_REPO         = os.getenv("MODULES_REPO",         "gcp_terraform-modules")
-MODULES_SUBDIR       = os.getenv("MODULES_SUBDIR",       "terraform/modules")
+CATALOG_OWNER         = os.getenv("CATALOG_OWNER",         "rjones-projects")
+CATALOG_REPO          = os.getenv("CATALOG_REPO",          "catalog")
+CATALOG_MAPPING_FILE  = os.getenv("CATALOG_MAPPING_FILE",  "gcp-mapping.yaml")
+CATALOG_PATTERNS_FILE = os.getenv("CATALOG_PATTERNS_FILE", "catalog.yaml")
+MODULES_OWNER         = os.getenv("MODULES_OWNER",         "rjones-projects")
+MODULES_REPO          = os.getenv("MODULES_REPO",          "gcp_terraform-modules")
+MODULES_SUBDIR        = os.getenv("MODULES_SUBDIR",        "terraform/modules")
 
 # Used in generated main.tf module source URLs (not for HTTP calls).
 GCP_MODULES_SOURCE = f"github.com/{MODULES_OWNER}/{MODULES_REPO}"
@@ -140,18 +144,61 @@ class CatalogResolver:
 
     def _fetch_mapping(self) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
         """
-        Fetch the Backstage catalog YAML via the file service and return:
+        Fetch both catalog sources and return:
           - block_modules: building_block name -> [primary module names realizing it]
           - module_deps:    module name -> [names of other modules whose outputs it
-                             needs wired into its inputs]
+                             may need wired into its inputs]
 
-        Each Component's `metadata.dependencies` is a dict of
-        `{primary_module: [dependency_module, ...]}`. A building block may realize to
-        several primary modules at once (e.g. "network" -> network/firewall/dns/...),
-        and `module_deps` is the union of every dict's entries across the whole
-        catalog, since a module's own dependency list is recorded wherever that
-        module first appears as a key — not necessarily under the block being
-        resolved right now.
+        module_deps is merged from two sources:
+          1. Fine-grained, module-specific wiring declared directly on a
+             terraformModules entry in gcp-mapping.yaml via `dependsOn` — e.g.
+             "firewall" needs "network"'s output even though they're both primary
+             modules of the same "network" building block, a relationship
+             building-block-level dependencies can't express.
+          2. Coarser building-block-to-building-block dependencies, recorded per
+             architecture pattern (`kind: System`) in catalog.yaml under
+             `spec.metadata.dependencies` — a dict of
+             `{building_block: [building_block, ...]}`. Expanded to each dependency
+             block's primary modules, so every primary module of a block inherits a
+             dependency on every primary module of the blocks it depends on.
+        """
+        block_modules, intra_module_deps = self._fetch_block_modules()
+        block_deps = self._fetch_block_dependencies()
+
+        module_deps: dict[str, list[str]] = {}
+
+        def add_deps(module_name: str, deps: list[str]) -> None:
+            # A module can depend on itself only by mistake (e.g. it belongs to more
+            # than one building block and a dependency block's modules happen to
+            # include it) — exclude that to avoid a self-referencing module.
+            deps = [d for d in deps if d != module_name]
+            if not deps:
+                return
+            existing = module_deps.setdefault(module_name, [])
+            existing.extend(d for d in deps if d not in existing)
+
+        for module_name, deps in intra_module_deps.items():
+            add_deps(module_name, deps)
+
+        for block, modules in block_modules.items():
+            dep_blocks = block_deps.get(block, [])
+            if not dep_blocks:
+                continue
+            candidate_deps: list[str] = []
+            for dep_block in dep_blocks:
+                candidate_deps.extend(block_modules.get(dep_block, []))
+            for module_name in modules:
+                add_deps(module_name, candidate_deps)
+
+        return block_modules, module_deps
+
+    @staticmethod
+    def _fetch_block_modules() -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+        """
+        Fetch gcp-mapping.yaml and return:
+          - block_modules: building_block name -> [primary module names]
+          - intra_module_deps: module name -> [other module names it explicitly
+            depends on], from an optional `dependsOn` key on its terraformModules entry
         """
         try:
             docs = get_client().proxy_catalog_file(
@@ -161,22 +208,68 @@ class CatalogResolver:
             raise RuntimeError(f"Failed to fetch catalog mapping: {exc}") from exc
 
         block_modules: dict[str, list[str]] = {}
-        module_deps: dict[str, list[str]] = {}
+        intra_module_deps: dict[str, list[str]] = {}
         for doc in docs:
             if not isinstance(doc, dict) or doc.get("kind") != "Component":
                 continue
-            metadata = doc.get("metadata") or {}
-            name = metadata.get("name", "")
+            name = (doc.get("metadata") or {}).get("name", "")
             if not name:
                 continue
-            dependencies = metadata.get("dependencies")
-            if not isinstance(dependencies, dict):
-                dependencies = {}
-            block_modules[name] = self._valid_module_names(dependencies.keys())
-            for module_name, deps in dependencies.items():
-                module_deps[str(module_name).strip()] = self._valid_module_names(deps)
+            refs = (doc.get("spec") or {}).get("terraformModules") or []
+            modules, deps = CatalogResolver._parse_terraform_modules(refs)
+            block_modules[name] = modules
+            for module_name, module_deps_list in deps.items():
+                intra_module_deps.setdefault(module_name, []).extend(module_deps_list)
+        return block_modules, intra_module_deps
 
-        return block_modules, module_deps
+    @staticmethod
+    def _fetch_block_dependencies() -> dict[str, list[str]]:
+        """building_block name -> [building blocks it depends on], from catalog.yaml."""
+        try:
+            docs = get_client().proxy_catalog_file(
+                CATALOG_OWNER, CATALOG_REPO, CATALOG_PATTERNS_FILE
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to fetch catalog patterns: {exc}") from exc
+
+        block_deps: dict[str, list[str]] = {}
+        for doc in docs:
+            if not isinstance(doc, dict) or doc.get("kind") != "System":
+                continue
+            dependencies = ((doc.get("spec") or {}).get("metadata") or {}).get("dependencies")
+            if not isinstance(dependencies, dict):
+                continue
+            for block_name, deps in dependencies.items():
+                block_deps[str(block_name).strip()] = CatalogResolver._valid_module_names(deps)
+        return block_deps
+
+    @staticmethod
+    def _parse_terraform_modules(refs: list) -> tuple[list[str], dict[str, list[str]]]:
+        """
+        Parse a `terraformModules` list where each entry is one of:
+          - "Component:module_name"
+          - {"Component": "module_name"}
+          - {"Component": "module_name", "dependsOn": ["other_module", ...]}
+        Returns (module_names, {module_name: [dependsOn names]}).
+        """
+        modules: list[str] = []
+        deps: dict[str, list[str]] = {}
+        for ref in refs:
+            if isinstance(ref, dict):
+                # "Component: module_name" (space after colon) is parsed by YAML
+                # as {"Component": "module_name", ...} — extract the value directly.
+                name = str(ref.get("Component", "")).strip()
+                depends_on = ref.get("dependsOn")
+            else:
+                # "Component:module_name" (no space) stays as a plain string.
+                name = re.sub(r"^Component:\s*", "", str(ref)).strip()
+                depends_on = None
+            if not (name and re.match(r"^[a-zA-Z][a-zA-Z0-9_]*$", name)):
+                continue
+            modules.append(name)
+            if depends_on:
+                deps[name] = CatalogResolver._valid_module_names(depends_on)
+        return modules, deps
 
     @staticmethod
     def _valid_module_names(names) -> list[str]:
