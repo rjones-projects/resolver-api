@@ -9,12 +9,20 @@ environment variable (default: https://repo-api-479677124022.europe-west2.run.ap
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Optional
 
 import httpx
 import yaml
 
 FILE_SERVICE_URL: str = os.getenv("FILE_SERVICE_URL", "https://repo-api-479677124022.europe-west2.run.app")
+
+# The file service intermittently returns 5xx or times out on otherwise-valid
+# requests; GET is idempotent so retrying a couple of times clears most of these
+# transient blips. 4xx (e.g. 404 for a missing file) is not retried — it's a real
+# answer, not a hiccup.
+_GET_RETRY_ATTEMPTS = 3
+_GET_RETRY_BACKOFF_SECONDS = 0.5
 
 
 class FileServiceClient:
@@ -30,10 +38,19 @@ class FileServiceClient:
     def _get(self, endpoint: str, **params: Any) -> httpx.Response:
         url = f"{self.base_url}{endpoint}"
         filtered = {k: v for k, v in params.items() if v is not None}
-        with httpx.Client(timeout=15) as client:
-            resp = client.get(url, params=filtered)
-        resp.raise_for_status()
-        return resp
+        for attempt in range(_GET_RETRY_ATTEMPTS):
+            try:
+                with httpx.Client(timeout=15) as client:
+                    resp = client.get(url, params=filtered)
+                resp.raise_for_status()
+                return resp
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code < 500 or attempt == _GET_RETRY_ATTEMPTS - 1:
+                    raise
+            except httpx.TimeoutException:
+                if attempt == _GET_RETRY_ATTEMPTS - 1:
+                    raise
+            time.sleep(_GET_RETRY_BACKOFF_SECONDS * (attempt + 1))
 
     def _post(self, endpoint: str, json_body: dict[str, Any]) -> httpx.Response:
         url = f"{self.base_url}{endpoint}"
