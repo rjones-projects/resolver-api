@@ -1,0 +1,39 @@
+name: Build and Push Docker Image
+description: Configure Docker for Artifact Registry, then build and push a tagged image (plus "latest").
+
+inputs:
+  registry:
+    description: Artifact Registry host, e.g. europe-west2-docker.pkg.dev.
+    required: true
+  image:
+    description: Full image path without tag, e.g. europe-west2-docker.pkg.dev/project/repo/image.
+    required: true
+  tag:
+    description: Primary tag to build and push, in addition to "latest".
+    required: true
+  build_args:
+    description: Newline-separated KEY=VALUE list, each passed as a docker build --build-arg.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Configure Docker for Artifact Registry
+      shell: bash
+      run: gcloud auth configure-docker ${{ inputs.registry }} --quiet
+
+    - name: Build and push image
+      shell: bash
+      run: |
+        build_args=()
+        while IFS= read -r arg; do
+          [ -n "$arg" ] && build_args+=(--build-arg "$arg")
+        done <<< "${{ inputs.build_args }}"
+
+        docker build "${build_args[@]}" \
+          --tag ${{ inputs.image }}:${{ inputs.tag }} \
+          --tag ${{ inputs.image }}:latest \
+          .
+        docker push ${{ inputs.image }}:${{ inputs.tag }}
+        docker push ${{ inputs.image }}:latest

@@ -1,0 +1,22 @@
+name: GCP Auth
+description: Authenticate to Google Cloud via Workload Identity Federation and set up the Cloud SDK.
+
+inputs:
+  workload_identity_provider:
+    description: Workload Identity Federation provider resource name.
+    required: true
+  service_account:
+    description: Service account email to impersonate.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ inputs.workload_identity_provider }}
+        service_account: ${{ inputs.service_account }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2

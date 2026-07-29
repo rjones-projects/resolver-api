@@ -30,30 +30,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+      - name: GCP Auth
+        uses: ./.github/actions/gcp-auth
         with:
           workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
           service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
 
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ env.REGISTRY }} --quiet
-
       - name: Build and push image
-        run: |
-          docker build \
-            --build-arg NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }} \
-            --tag ${{ env.IMAGE }}:${{ github.sha }} \
-            --tag ${{ env.IMAGE }}:latest \
-            .
-          docker push ${{ env.IMAGE }}:${{ github.sha }}
-          docker push ${{ env.IMAGE }}:latest
+        uses: ./.github/actions/build-push-image
+        with:
+          registry: ${{ env.REGISTRY }}
+          image: ${{ env.IMAGE }}
+          tag: ${{ github.sha }}
+          build_args: |
+            NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }}
 
       - name: Deploy to Cloud Run
-        uses: google-github-actions/deploy-cloudrun@v2
+        uses: ./.github/actions/deploy-cloud-run
         with:
           service: ${{ env.SERVICE }}
           region: ${{ env.REGION }}

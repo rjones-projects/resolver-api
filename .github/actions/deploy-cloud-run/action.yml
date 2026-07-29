@@ -1,0 +1,28 @@
+name: Deploy to Cloud Run
+description: Deploy a container image to a Cloud Run service.
+
+inputs:
+  service:
+    description: Cloud Run service name.
+    required: true
+  region:
+    description: Cloud Run region.
+    required: true
+  image:
+    description: Fully-qualified image reference, including tag.
+    required: true
+  flags:
+    description: Extra flags passed straight through to the deploy-cloudrun action.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Deploy to Cloud Run
+      uses: google-github-actions/deploy-cloudrun@v2
+      with:
+        service: ${{ inputs.service }}
+        region: ${{ inputs.region }}
+        image: ${{ inputs.image }}
+        flags: ${{ inputs.flags }}
