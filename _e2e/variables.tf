@@ -36,12 +36,6 @@ variable "allow_metadata_server_egress" {
   default     = true
 }
 
-variable "auto_create_subnetworks" {
-  description = "Whether to create subnetworks automatically."
-  type        = bool
-  default     = false
-}
-
 variable "bucket_default" {
   description = "A bucket object to be merged into."
   type        = object({
@@ -52,6 +46,7 @@ variable "bucket_default" {
     kms_key_name                = string
     labels                      = map(string)
     versioning_enabled          = bool
+    public_access_prevention    = string
     accesses = list(object({
       role    = string
       members = list(string)
@@ -108,6 +103,7 @@ variable "bucket_default" {
     kms_key_name                = null
     labels                      = {}
     versioning_enabled          = true
+    public_access_prevention    = "enforced"
     accesses                    = []
     retention_policy            = null
     logging                     = null
@@ -138,7 +134,7 @@ variable "context" {
 }
 
 variable "create_googleapis_dns" {
-  description = "Create Cloud DNS private zones for googleapis.com and gcr.io"
+  description = "Create Cloud DNS private zones for googleapis.com, gcr.io, and pkg.dev"
   type        = bool
   default     = true
 }
@@ -348,6 +344,18 @@ variable "enable_private_service_connect" {
   default     = true
 }
 
+variable "export_custom_routes" {
+  description = "Export custom routes on the servicenetworking peering (PSC). Set true when peered networks need custom route export."
+  type        = bool
+  default     = true
+}
+
+variable "export_subnet_routes_with_public_ip" {
+  description = "Export subnet routes with public IP on the servicenetworking peering (PSC)."
+  type        = bool
+  default     = false
+}
+
 variable "external_global_address" {
   description = "External global address configuration from project.yaml. Must contain a 'spec' list of address definitions."
   type        = any
@@ -443,6 +451,8 @@ variable "iam_custom_role_stack_default" {
       "roles/dataform.admin",
       "roles/dataproc.admin",
       "roles/dns.admin",
+      "roles/run.admin",
+      "roles/compute.networkAdmin",
       "roles/iam.serviceAccountAdmin",
       "roles/cloudkms.admin",
       "roles/logging.admin",
@@ -459,8 +469,36 @@ variable "iam_custom_role_stack_default" {
       "compute.firewallPolicies.move",
       "compute.securityPolicies.copyRules",
       "compute.securityPolicies.move",
+      "compute.orgRolloutPlans.create",
+      "compute.orgRolloutPlans.delete",
+      "compute.orgRolloutPlans.get",
+      "compute.orgRolloutPlans.list",
+      "compute.orgRolloutPlans.update",
+      "compute.orgRolloutPlans.use",
+      "compute.orgRolloutPlans.view",
+      "compute.orgRolloutPlans.viewAuditTrail",
+      "compute.orgRollouts.cancel",
+      "compute.orgRollouts.create",
+      "compute.orgRollouts.delete",
+      "compute.orgRollouts.get",
+      "compute.orgRollouts.list",
+      "compute.orgRollouts.update",
+      "compute.orgRollouts.use",
+      "compute.orgRollouts.view",
+      "compute.orgRollouts.viewAuditTrail",
+      "compute.orgRollouts.pause",
+      "compute.orgRollouts.resume",
+      "compute.orgRollouts.rollback",
+      "compute.orgRollouts.start",
+      "compute.orgRollouts.stop",
+      "compute.orgRollouts.suspend",
+      "compute.orgRollouts.unpause",
+      "compute.orgRollouts.unroll",
+      "compute.orgRollouts.unsuspend",
+      "compute.orgRollouts.unstop",
       "stackdriver.projects.edit",
       "resourcemanager.projects.list",
+      "servicenetworking.services.deletePeering",
       "compute.securityPolicies.removeAssociation",
       "eventarc.multiProjectSources.collectGoogleApiEvents",
       "compute.securityPolicies.addAssociation",
@@ -515,8 +553,39 @@ variable "iam_custom_role_stack_default" {
 
 variable "iam_service_account" {
   description = "Service account config with items"
-  type        = any
+  type        = object({
+    spec = optional(list(object({
+      project_id                 = optional(string)
+      name                       = optional(string)
+      display_name               = optional(string)
+      description                = optional(string)
+      prefix                     = optional(string)
+      service_account_reuse      = optional(bool)
+      tag_bindings               = optional(map(string))
+      iam_bindings               = optional(map(list(string)))
+      iam_billing_roles          = optional(map(list(string)))
+      iam_by_principles_additive = optional(map(list(string)))
+      iam_by_principles          = optional(map(list(string)))
+      iam_folder_roles           = optional(map(list(string)))
+      iam_organization_roles     = optional(map(list(string)))
+      iam_project_roles          = optional(list(string))
+      iam_sa_roles               = optional(map(list(string)))
+      iam_storage_roles          = optional(map(list(string)))
+    })), [])
+  })
   default     = null
+}
+
+variable "import_custom_routes" {
+  description = "Import custom routes on the servicenetworking peering (PSC)."
+  type        = bool
+  default     = false
+}
+
+variable "import_subnet_routes_with_public_ip" {
+  description = "Import subnet routes with public IP on the servicenetworking peering (PSC)."
+  type        = bool
+  default     = false
 }
 
 variable "ingress_health_check" {
@@ -669,18 +738,11 @@ variable "routing_mode" {
 variable "service_account_default" {
   description = "A service account object to be merged into"
   type        = object({
-    name                         = string
-    display_name                 = string
-    description                  = string
-    prefix                       = string
-    create_ignore_already_exists = bool
-    service_account_reuse = object({
-      use_data_source = bool
-      attributes = object({
-        project_number = number
-        unique_id      = string
-      })
-    })
+    name                       = string
+    display_name               = string
+    description                = string
+    prefix                     = string
+    service_account_reuse      = bool
     tag_bindings               = map(string)
     iam_bindings               = map(list(string))
     iam_billing_roles          = map(list(string))
@@ -688,27 +750,26 @@ variable "service_account_default" {
     iam_by_principles          = map(list(string))
     iam_folder_roles           = map(list(string))
     iam_organization_roles     = map(list(string))
-    iam_project_roles          = map(list(string))
+    iam_project_roles          = list(string)
     iam_sa_roles               = map(list(string))
     iam_storage_roles          = map(list(string))
   })
   default     = {
-    name                         = null
-    display_name                 = "Terraform-managed"
-    description                  = null
-    prefix                       = null
-    create_ignore_already_exists = null
-    service_account_reuse        = null
-    tag_bindings                 = {}
-    iam_bindings                 = {}
-    iam_billing_roles            = {}
-    iam_by_principles_additive   = {}
-    iam_by_principles            = {}
-    iam_folder_roles             = {}
-    iam_organization_roles       = {}
-    iam_project_roles            = {}
-    iam_sa_roles                 = {}
-    iam_storage_roles            = {}
+    name                       = null
+    display_name               = "Terraform-managed"
+    description                = null
+    prefix                     = null
+    service_account_reuse      = false
+    tag_bindings               = {}
+    iam_bindings               = {}
+    iam_billing_roles          = {}
+    iam_by_principles_additive = {}
+    iam_by_principles          = {}
+    iam_folder_roles           = {}
+    iam_organization_roles     = {}
+    iam_project_roles          = []
+    iam_sa_roles               = {}
+    iam_storage_roles          = {}
   }
 }
 

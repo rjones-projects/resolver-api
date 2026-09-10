@@ -28,7 +28,6 @@ module "network" {
   project_id                     = var.project_id
   region                         = var.region
   network                        = var.network
-  auto_create_subnetworks        = var.auto_create_subnetworks
   routing_mode                   = var.routing_mode
   description                    = var.description
   common_resource_id             = var.common_resource_id
@@ -65,6 +64,10 @@ module "network" {
   googleapis_dns_mode            = var.googleapis_dns_mode
   allow_dns_egress               = var.allow_dns_egress
   allow_metadata_server_egress   = var.allow_metadata_server_egress
+  export_custom_routes           = var.export_custom_routes
+  import_custom_routes           = var.import_custom_routes
+  export_subnet_routes_with_public_ip = var.export_subnet_routes_with_public_ip
+  import_subnet_routes_with_public_ip = var.import_subnet_routes_with_public_ip
 }
 
 module "firewall" {
@@ -77,7 +80,7 @@ module "firewall" {
   factories_config               = var.factories_config
   ingress_rules                  = var.ingress_rules
   named_ranges                   = var.named_ranges
-  network                        = var.network
+  network                        = module.network.vpc_network.name
   project_id                     = var.project_id
   region                         = var.region
 }
