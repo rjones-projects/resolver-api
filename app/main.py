@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Owner/org under which generated Terraform repos are created.
-REPO_OWNER = os.getenv("REPO_OWNER", "rjones-projects")
+REPO_OWNER = os.getenv("REPO_OWNER", "microservicesolutions")
 # Subfolder within the new repo that the generated Terraform is written to.
 REPO_DESTINATION = os.getenv("REPO_DESTINATION", "infra")
 
