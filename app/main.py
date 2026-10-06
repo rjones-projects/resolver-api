@@ -1,5 +1,6 @@
 """
-Resolver API — resolves building blocks into Terraform files via the catalog mapping.
+Resolver API — converts module-config YAML documents into Terraform that calls the
+dne-pe-terraform-modules modules.
 """
 
 import logging
@@ -11,11 +12,13 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+import yaml
+from fastapi import FastAPI, HTTPException, Query, Request
+from pydantic import BaseModel, Field, ValidationError
+from starlette.concurrency import run_in_threadpool
 
-from app.catalog_resolver import CatalogResolver
 from app.file_client import get_client
+from app.yaml_resolver import YamlConfigError, YamlResolver, load_yaml
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -67,7 +70,7 @@ def _push_terraform(result: dict, deployment_id: Optional[str]) -> dict:
 
 app = FastAPI(
     title="Resolver API",
-    description="Resolve building blocks into Terraform files",
+    description="Convert module-config YAML into Terraform files",
     version="1.0.0",
 )
 
@@ -85,36 +88,50 @@ def health():
 
 # ── Resolve endpoint ─────────────────────────────────────────────────────────
 
-class DeploymentPayload(BaseModel):
-    patternId: Optional[str] = None
-    projectId: Optional[str] = None
-    projectName: Optional[str] = None
-    building_blocks: dict[str, Any] = Field(
-        ...,
-        description="Map of building block name to override values dict (empty dict {} for no overrides).",
-    )
-    terraform_version: Optional[str] = Field("~> 1.9")
-    backend: Optional[str] = None
-    modules_ref: Optional[str] = Field("main")
-    estimatedMonthlyCost: Optional[float] = None
-    createdBy: Optional[str] = None
-    timestamp: Optional[str] = None
+_EXAMPLE_YAML = """\
+project_id: "my-project-id"
+region: "europe-west1"
+
+terraform:
+  required_version: ">= 1.14.0"
+  providers:
+    google: ">= 7.17.0, < 8.0.0"
+
+project_services:
+  source:
+    version: v1.0.3
+  depends_on: []
+  spec:
+    - name: "cloud-run-required-apis"
+      service_list:
+        - "run.googleapis.com"
+
+cloud_run:
+  source:
+    version: v1.1.2
+  depends_on:
+    - project_services
+  spec:
+    - name: "hello-api"
+      type: "SERVICE"
+      containers:
+        app:
+          image: "europe-west1-docker.pkg.dev/my-project-id/cloud-run-source-deploy/hello-api:latest"
+"""
 
 
-class DeploymentRequest(BaseModel):
+class ResolveRequest(BaseModel):
     deploymentId: Optional[str] = None
-    status: Optional[str] = None
-    payload: DeploymentPayload
-    message: Optional[str] = None
-    createdBy: Optional[str] = None
-    timestamp: Optional[str] = None
+    yaml: Optional[str] = Field(None, description="The module-config YAML document as a string.")
+    config: Optional[dict[str, Any]] = Field(
+        None, description="The module-config document as a JSON object (alternative to `yaml`)."
+    )
 
 
-class DeploymentResolveResponse(BaseModel):
+class ResolveResponse(BaseModel):
     deploymentId: Optional[str] = None
     status: str = "resolved"
     projectId: Optional[str] = None
-    projectName: Optional[str] = None
     main_tf: str
     variables_tf: str
     terraform_tfvars: str
@@ -122,61 +139,69 @@ class DeploymentResolveResponse(BaseModel):
     repository: Optional[dict] = Field(
         None,
         description="Result of pushing the generated Terraform to a new repo "
-        "(repo name, branch, commit SHA, files), or an error if the push failed.",
+        "(repo name, branch, commit SHA, files), or an error if the push failed. "
+        "Null when push=false.",
     )
+
+
+def _parse_body(body: bytes, content_type: str) -> tuple[dict[str, Any], Optional[str]]:
+    """Return (module-config document, deploymentId from a JSON body)."""
+    if "json" in content_type:
+        req = ResolveRequest.model_validate_json(body)
+        if (req.yaml is None) == (req.config is None):
+            raise YamlConfigError("Provide exactly one of 'yaml' or 'config'.")
+        doc = load_yaml(req.yaml) if req.yaml is not None else req.config
+        return doc, req.deploymentId
+    return load_yaml(body.decode("utf-8")), None
 
 
 @app.post(
     "/resolve",
-    response_model=DeploymentResolveResponse,
-    summary="Resolve building blocks into Terraform files",
-    responses={
-        502: {"description": "Failed to fetch catalog mapping or module variables from GitHub"},
+    response_model=ResolveResponse,
+    summary="Convert a module-config YAML document into Terraform",
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/yaml": {"schema": {"type": "string"}, "example": _EXAMPLE_YAML},
+                "application/json": {"schema": ResolveRequest.model_json_schema()},
+            },
+        }
     },
+    responses={422: {"description": "Invalid YAML or module config"}},
 )
-def resolve_catalog(request: DeploymentRequest):
+async def resolve(
+    request: Request,
+    deploymentId: Optional[str] = Query(None, description="Deployment ID (raw YAML bodies)."),
+    push: bool = Query(True, description="Push the generated Terraform to a new repo."),
+):
     """
-    Accepts a deployment payload containing **building block** names mapped to their
-    variable overrides. Resolves each block to GCP Terraform modules via the catalog
-    mapping YAML, fetches each module's `variables.tf` from GitHub, and returns
-    ready-to-use `main.tf`, `variables.tf`, and `terraform.tfvars`.
+    Accepts a module-config YAML document (raw `application/yaml` body, or JSON
+    `{"yaml": "..."}` / `{"config": {...}}`). Every top-level key other than
+    `project_id`, `region`, `env` and `terraform` names a module under
+    `terraform/modules` in the modules repo; its `source.version` pins the module's
+    release tag, `depends_on` orders it after other modules, and the rest of the block
+    (e.g. `spec`) is passed to the module as its config input.
 
-    The `projectId` from the payload is written as `project_id` at the top of
-    `terraform.tfvars`. Override values for each block are routed to the correct
-    module config variable and deduplicated across blocks.
+    Returns `main.tf`, `variables.tf` and `terraform.tfvars`, and (unless
+    `push=false`) pushes them to a new repo.
     """
     try:
-        p = request.payload
-        overrides_map: dict[str, Any] = p.building_blocks
-        block_names = list(overrides_map.keys())
-
-        # Preamble vars written at the top of terraform.tfvars before block sections.
-        preamble: dict[str, Any] = {}
-        if p.projectId:
-            preamble["project_id"] = p.projectId
-
-        resolver = CatalogResolver(
-            building_blocks=block_names,
-            terraform_version=p.terraform_version or "~> 1.9",
-            backend=p.backend or "local",
-            modules_ref=p.modules_ref or "main",
-        )
-        result = resolver.resolve(overrides_map=overrides_map, tfvars_preamble=preamble or None)
-
-        repository = _push_terraform(result, request.deploymentId)
-
-        return {
-            "deploymentId": request.deploymentId,
-            "status": "resolved",
-            "projectId": p.projectId,
-            "projectName": p.projectName,
-            "repository": repository,
-            **result,
-        }
-    except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
-    except ValueError as exc:
+        doc, body_deployment_id = _parse_body(await request.body(), request.headers.get("content-type", ""))
+        deployment_id = body_deployment_id or deploymentId
+        result = YamlResolver(doc).resolve()
+    except (YamlConfigError, yaml.YAMLError, ValidationError, UnicodeDecodeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except Exception as exc:
-        logger.exception("Unexpected error during catalog resolution")
+        logger.exception("Unexpected error during YAML resolution")
         raise HTTPException(status_code=500, detail=str(exc))
+
+    repository = await run_in_threadpool(_push_terraform, result, deployment_id) if push else None
+
+    return {
+        "deploymentId": deployment_id,
+        "status": "resolved",
+        "projectId": result["summary"]["project_id"],
+        "repository": repository,
+        **result,
+    }

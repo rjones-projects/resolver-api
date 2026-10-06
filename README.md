@@ -1,20 +1,62 @@
 # Resolver API
 
-A lightweight REST API (FastAPI) that accepts a set of **building blocks** and resolves
-them into ready-to-use `main.tf`, `variables.tf`, and `terraform.tfvars` files.
+A lightweight REST API (FastAPI) that converts a **module-config YAML document** into
+ready-to-use `main.tf`, `variables.tf`, and `terraform.tfvars` that call the modules in
+[`dne-pe-terraform-modules`](https://github.com/VFGROUP-NSE-NDPE/dne-pe-terraform-modules)
+(`terraform/modules/<module>`).
 
 ## How it works
 
-1. Building block names are looked up in the catalog mapping
-   ([`gcp-mapping.yaml`](https://github.com/rjones-projects/catalog/blob/main/gcp-mapping.yaml))
-   to find their constituent GCP Terraform modules.
-2. Each module's `variables.tf` is fetched from
-   [`gcp_terraform-modules`](https://github.com/rjones-projects/gcp_terraform-modules)
-   via the file service.
-3. Variables from all modules are **merged and deduplicated**; required variables (no
-   upstream default) receive safe placeholder defaults and are annotated with a comment.
-4. The `terraform {}` block, provider stub, module blocks, `variables.tf`, and a
-   `terraform.tfvars` (from the supplied overrides) are generated in valid HCL.
+The YAML format is the one used by the module examples, e.g.
+`terraform/modules/cloud_run/examples/basic-service.yaml`:
+
+```yaml
+project_id: "my-project-id"          # required
+region: "europe-west1"               # optional, default europe-west1
+env: "dev"                           # optional, passed to modules that take `env`
+
+terraform:
+  required_version: ">= 1.14.0"
+  providers:
+    google: ">= 7.17.0, < 8.0.0"     # google-beta is pinned to the same range
+  backend: gcs                       # optional: "<type>" or {<type>: {settings}}; default local
+
+project_services:                    # top-level key = module directory name
+  source:
+    version: v1.0.3                  # -> ?ref=project_services-v1.0.3
+  depends_on: []
+  spec:
+    - name: "cloud-run-required-apis"
+      service_list: ["run.googleapis.com"]
+
+cloud_run:
+  source:
+    version: v1.1.2
+  depends_on: [project_services]
+  spec:
+    - name: "hello-api"
+      type: "SERVICE"
+      containers:
+        app:
+          image: "europe-west1-docker.pkg.dev/my-project-id/cloud-run-source-deploy/hello-api:latest"
+```
+
+1. Every top-level key other than `project_id`, `region`, `env` and `terraform` names a
+   module. It becomes a `module` block sourced from
+   `git::https://github.com/VFGROUP-NSE-NDPE/dne-pe-terraform-modules.git//terraform/modules/<module>?ref=<module>-<version>`
+   (the release-please tag; `MODULES_DEFAULT_REF`, default `main`, when `source.version` is absent).
+2. The rest of the block (`spec`, plus any other keys such as `alert_config`) is passed to
+   the module's config input of the same name (`cloud_run = var.cloud_run`) through an
+   `any`-typed variable whose value is written to `terraform.tfvars`. `source`,
+   `depends_on` and `module_overide_name` are consumed by the generator and not passed on.
+3. `project_id` / `region` / `env` are wired into each module that takes them.
+4. `depends_on` becomes `depends_on = [module.<name>, ...]`.
+5. To declare several instances of one module, repeat its top-level key and give each a
+   distinct `module_overide_name`; that name is used for the module block and its variable.
+   A `depends_on` entry naming the module (rather than an instance) covers all its instances.
+
+This mirrors the modules repo's own `.github/scripts/yaml_to_tfvars.py`. No `provider`
+block is generated — `providers.tf` is supplied by the repo-api.
 
 ---
 
@@ -42,37 +84,19 @@ Returns `{"status": "ok"}`.
 
 ### `POST /resolve`
 
-Accepts a deployment payload whose `building_blocks` map each building block name to a
-dict of variable overrides (use `{}` for no overrides). Resolves them to GCP Terraform
-modules and returns ready-to-use `main.tf`, `variables.tf`, and `terraform.tfvars`.
-
-**Request body**
+Send the YAML document either as a raw body (`Content-Type: application/yaml`) or as JSON:
 
 ```json
-{
-  "deploymentId": "deploy-123",
-  "payload": {
-    "projectId": "my-gcp-project",
-    "projectName": "My Project",
-    "building_blocks": {
-      "bucket": {},
-      "sql": { "tier": "db-custom-2-7680" },
-      "network": {}
-    },
-    "terraform_version": "~> 1.9",
-    "backend": "gcs",
-    "modules_ref": "main"
-  }
-}
+{ "deploymentId": "deploy-123", "yaml": "project_id: my-project-id
+..." }
 ```
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `payload.building_blocks` | object | ✅ | Map of building block name → override values dict (`{}` for none) |
-| `payload.projectId` | string | | Written as `project_id` at the top of `terraform.tfvars` |
-| `payload.terraform_version` | string | | Default `~> 1.9` |
-| `payload.backend` | string | | Backend type stub (`gcs`, `s3`, `azurerm`, …) |
-| `payload.modules_ref` | string | | Git ref to pin module sources to (default `main`) |
+(or `"config": { ... }` with the document as a JSON object instead of `"yaml"`).
+
+| Query param | Default | Description |
+|---|---|---|
+| `deploymentId` | | Deployment ID, for raw YAML bodies (JSON bodies carry it in the body) |
+| `push` | `true` | Push the generated files to a new `IDP-demo-<xyz>` repo via the repo-api |
 
 **Response**
 
@@ -80,44 +104,51 @@ modules and returns ready-to-use `main.tf`, `variables.tf`, and `terraform.tfvar
 {
   "deploymentId": "deploy-123",
   "status": "resolved",
-  "projectId": "my-gcp-project",
-  "projectName": "My Project",
-  "main_tf": "terraform {\n  required_version = ...",
-  "variables_tf": "variable \"project_id\" {\n ...",
-  "terraform_tfvars": "project_id = \"my-gcp-project\"\n ...",
+  "projectId": "my-project-id",
+  "main_tf": "terraform {
+  required_version = ...",
+  "variables_tf": "variable \"project_id\" {
+ ...",
+  "terraform_tfvars": "project_id = \"my-project-id\"
+ ...",
   "summary": {
-    "building_blocks_requested": ["bucket", "sql", "network"],
-    "building_blocks_resolved": ["bucket", "sql", "network"],
-    "building_blocks_unresolved": [],
-    "modules_resolved": ["gcs", "cloud_sql", "network", "firewall", "dns"],
-    "variables_extracted": 24,
-    "modules_with_fetch_errors": []
-  }
+    "project_id": "my-project-id",
+    "region": "europe-west1",
+    "modules": [
+      {"name": "project_services", "module": "project_services", "source": "git::...?ref=project_services-v1.0.3", "depends_on": []},
+      {"name": "cloud_run", "module": "cloud_run", "source": "git::...?ref=cloud_run-v1.1.2", "depends_on": ["project_services"]}
+    ]
+  },
+  "repository": { "status": "pushed", "repo": "IDP-demo-abc", "...": "..." }
 }
 ```
+
+Invalid YAML or module config (missing `project_id`, unknown `depends_on` target,
+repeated module without `module_overide_name`, …) returns `422` with a `detail` message.
 
 **Example curl**
 
 ```bash
-curl -s -X POST http://localhost:8080/resolve \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "payload": {
-      "projectId": "my-gcp-project",
-      "building_blocks": { "bucket": {}, "sql": {} },
-      "backend": "gcs"
-    }
-  }' | jq .
+curl -s -X POST 'http://localhost:8080/resolve?push=false'   -H 'Content-Type: application/yaml'   --data-binary @../dne-pe-terraform-modules/terraform/modules/cloud_run/examples/basic-service.yaml | jq .
 ```
+
+| Env var | Default |
+|---|---|
+| `MODULES_SOURCE` | `git::https://github.com/VFGROUP-NSE-NDPE/dne-pe-terraform-modules.git` |
+| `MODULES_SUBDIR` | `terraform/modules` |
+| `MODULES_DEFAULT_REF` | `main` |
+| `REPO_OWNER` / `REPO_DESTINATION` | `microservicesolutions` / `infra` |
 
 ---
 
 ## Running tests
 
 ```bash
-pip install pytest pytest-asyncio
+pip install pytest
 pytest tests/ -v
 ```
+
+`python _e2e_gen.py [path/to/config.yaml]` writes the generated files to `_e2e/`.
 
 ---
 
@@ -128,10 +159,10 @@ resolver-api/
 ├── app/
 │   ├── __init__.py
 │   ├── main.py               # FastAPI app, routes, request/response models
-│   ├── catalog_resolver.py   # Building-block → GCP module resolver & HCL generation
-│   └── file_client.py        # Client for the GitHub file service
+│   ├── yaml_resolver.py      # Module-config YAML → main.tf / variables.tf / terraform.tfvars
+│   └── file_client.py        # Client for the repo-api (pushes generated Terraform)
+├── tests/
 ├── Dockerfile
-├── docker-compose.yml
 ├── requirements.txt
 └── README.md
 ```
@@ -167,10 +198,6 @@ gcloud iam workload-identity-pools providers describe github-provider --project=
 #secret - WIF_SERVICE_ACCOUNT
 github-actions@vf-gned-ngdi-alpha-ing.iam.gserviceaccount.com
 
-#github variables used by the resolver
-CATALOG_OWNER=rjones-projects
-CATALOG_REPO=catalog
-CATALOG_MAPPING_FILE=gcp-mapping.yaml
 
 docker build -t resolver-api .
 #docker tag resolver-api europe-west2-docker.pkg.dev/idp-poc-495014/resolver-api/resolver-api:latest
