@@ -96,7 +96,7 @@ Send the YAML document either as a raw body (`Content-Type: application/yaml`) o
 | Query param | Default | Description |
 |---|---|---|
 | `deploymentId` | | Deployment ID, for raw YAML bodies (JSON bodies carry it in the body) |
-| `push` | `true` | Push the generated files to a new `IDP-demo-<xyz>` repo via the repo-api |
+| `push` | `true` | Push the generated files to a new `<REPO_PREFIX><suffix>` repo (e.g. `IDP-demo-a1b2c3`) via the repo-api |
 
 **Response**
 
@@ -119,7 +119,7 @@ Send the YAML document either as a raw body (`Content-Type: application/yaml`) o
       {"name": "cloud_run", "module": "cloud_run", "source": "git::...?ref=cloud_run-v1.1.2", "depends_on": ["project_services"]}
     ]
   },
-  "repository": { "status": "pushed", "repo": "IDP-demo-abc", "...": "..." }
+  "repository": { "status": "pushed", "repo": "IDP-demo-a1b2c3", "...": "..." }
 }
 ```
 
@@ -138,6 +138,7 @@ curl -s -X POST 'http://localhost:8080/resolve?push=false'   -H 'Content-Type: a
 | `MODULES_SUBDIR` | `terraform/modules` |
 | `MODULES_DEFAULT_REF` | `main` |
 | `REPO_OWNER` / `REPO_DESTINATION` | `microservicesolutions` / `infra` |
+| `REPO_PREFIX` | `IDP-demo-` (a random 6-character lowercase letter/digit suffix is appended) |
 
 ---
 

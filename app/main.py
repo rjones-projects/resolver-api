@@ -27,16 +27,18 @@ logger = logging.getLogger(__name__)
 REPO_OWNER = os.getenv("REPO_OWNER", "microservicesolutions")
 # Subfolder within the new repo that the generated Terraform is written to.
 REPO_DESTINATION = os.getenv("REPO_DESTINATION", "infra")
+# Prefix for generated repo names; a random suffix is appended directly to it.
+REPO_PREFIX = os.getenv("REPO_PREFIX", "IDP-demo-")
 
 def _generate_repo_name() -> str:
-    """Build a new repo name: 'IDP-demo-' plus a random 3-letter suffix."""
-    suffix = "".join(random.choices(string.ascii_lowercase, k=3))
-    return f"IDP-demo-{suffix}"
+    """Build a new repo name: REPO_PREFIX plus a random 6-character [a-z0-9] suffix."""
+    suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    return f"{REPO_PREFIX}{suffix}"
 
 
 def _push_terraform(result: dict, deployment_id: Optional[str]) -> dict:
     """
-    Push the generated Terraform files to a new 'IDP-demo-<xyz>' repo via the
+    Push the generated Terraform files to a new '<REPO_PREFIX><suffix>' repo via the
     repo-api. Returns a status dict for the response. Failures are caught and
     reported (status='error') so a push problem never discards the generated
     Terraform the caller still wants.
